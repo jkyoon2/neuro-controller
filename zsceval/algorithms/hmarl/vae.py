@@ -178,7 +178,17 @@ class SkillVAE(nn.Module):
         z, mu, log_var, pred_features, pred_actions, target_features = self.forward(obs_seq, action_seq, task_id)
         
         recon_feat_loss = F.mse_loss(pred_features, target_features)
-        recon_act_loss = F.mse_loss(pred_actions, action_seq)
+
+        B, T, A_dim = pred_actions.shape
+
+        # Convert action_seq to target indices -> one-hot to indices (class integer for CrossEntropyLoss)    
+        target_action_indices = action_seq.argmax(dim=-1).view(-1)
+
+        # Flatten predictions and targets for CrossEntropyLoss
+        pred_actions = pred_actions.view(-1, A_dim)
+
+        # Cross Entropy Loss (Softmax 내부적 적용)
+        recon_act_loss = F.cross_entropy(pred_actions, target_action_indices)
         
         scaled_feat_loss = recon_feat_loss * feature_weight
         scaled_act_loss = recon_act_loss * action_weight

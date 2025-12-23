@@ -77,10 +77,15 @@ def parse_args(args, parser: argparse.ArgumentParser):
     parser.add_argument("--skill_dim", type=int, default=4)
     parser.add_argument("--t_seg", type=int, default=5)
     parser.add_argument("--intrinsic_alpha", type=float, default=0.3)
-    parser.add_argument("--vae_checkpoint_path", type=str, default="checkpoints/vae_epoch_004_1tasks_4d.pt")
+    parser.add_argument("--vae_checkpoint_path", type=str, default="/checkpoints/vae_epoch_002_1t_small_corridor_4d.pt")
     parser.add_argument("--high_buffer_size", type=int, default=50000)
     parser.add_argument("--high_batch_size", type=int, default=64)
     parser.add_argument("--intrinsic_scale", type=float, default=5.0)
+    parser.add_argument("--skill_range", type=float, default=4.0)
+    parser.add_argument("--use_constraint", action="store_true", default=False)
+    parser.add_argument("--bad_traj_path", type=str, default="")
+    parser.add_argument("--constraint_threshold", type=float, default=0.5)
+    parser.add_argument("--constraint_penalty", type=float, default=1.0)
     all_args = parser.parse_args(args)
 
     from zsceval.overcooked_config import OLD_LAYOUTS

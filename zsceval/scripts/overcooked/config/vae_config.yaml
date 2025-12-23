@@ -1,0 +1,63 @@
+# VAE Training Configuration
+
+# ========================================================================
+# Paths
+# ========================================================================
+paths:
+  vae_data_dir: "/home/juliecandoit98/neurocontroller/vae_data"
+  save_dir: "/home/juliecandoit98/neurocontroller/checkpoints"
+
+# ========================================================================
+# Data Filtering (None means use all)
+# ========================================================================
+data_filter:
+  layouts: ["random0_medium", "small_corridor", "random1", "random3"]  # e.g., ["random0_medium", "small_corridor"] or null for all
+  seeds: [5, 6, 7, 8, 9, 10]    # e.g., [5, 6, 7] or null for all
+  min_step: 20000 # e.g., 100000 or null
+  max_step: 10000000 # e.g., 1000000 or null
+
+# ========================================================================
+# Model Architecture
+# ========================================================================
+model:
+  obs_channels: 25
+  action_dim: 6
+  hidden_dim: 128
+  latent_dim: 4
+  k_timesteps: 5
+
+# ========================================================================
+# KL Annealing Strategy (Cyclical Annealing)
+# ========================================================================
+annealing:
+  beta_max: 0.05         # 최종 Beta 값
+  warmup_steps: 2000     # 초반 워밍업 구간 (Beta=0 유지)
+  n_cycles: 4            # 전체 학습 동안 반복할 cycle 수
+  cycle_ratio: 0.5       # 각 cycle 내에서 Beta를 올리는 비율 (0.5 = 50% 기간 동안 증가, 나머지 유지)
+
+# ========================================================================
+# Training Hyperparameters
+# ========================================================================
+training:
+  epochs: 5
+  batch_size: 64
+  lr: 0.001
+  seed: 42
+  num_workers: 1  # 4 -> 1 (DataLoader 안정성)
+  device: "cuda:1"  # "cuda", "cuda:0", "cuda:1", or "cpu"
+  
+# ========================================================================
+# Loss Function Weights
+# ========================================================================
+loss:
+  feature_weight: 30.0  # Feature reconstruction loss weight
+  action_weight: 100.0      # Action reconstruction loss weight
+
+# ========================================================================
+# Wandb Logging
+# ========================================================================
+wandb:
+  use_wandb: true
+  project: "overcooked-vae-multitask"
+  run_name: null  # auto-generated if null
+

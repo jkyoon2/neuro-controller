@@ -57,6 +57,70 @@ SHAPED_INFOS = [
     "IDLE_INTERACT",
 ]
 
+ERROR_TYPES = [
+    "ONION_COUNTER_REGRAB",
+    "COLLISION",
+    "IDLE_BACKTRACK",
+]
+
+
+class _SubgoalTracker:
+    def __init__(self, num_players, onion_regrab_window=2):
+        self.num_players = num_players
+        self.onion_regrab_window = onion_regrab_window
+        self.reset()
+
+    def reset(self, start_positions=None):
+        self._recent_onion_drops = {}
+        self._prev_positions = list(start_positions) if start_positions is not None else None
+        self._prev_prev_positions = None
+        self._prev_actions = None
+
+    def record_onion_drop(self, agent_idx, pos, timestep):
+        self._recent_onion_drops[pos] = (agent_idx, timestep)
+
+    def check_onion_regrab(self, agent_idx, pos, timestep):
+        record = self._recent_onion_drops.pop(pos, None)
+        if record is None:
+            return False
+        drop_agent, drop_timestep = record
+        if drop_agent != agent_idx:
+            return False
+        return (timestep - drop_timestep) <= self.onion_regrab_window
+
+    def compute_idle_backtrack(self, old_positions, new_positions, joint_action):
+        counts = [0] * self.num_players
+        if (
+            self._prev_positions is None
+            or self._prev_prev_positions is None
+            or self._prev_actions is None
+        ):
+            return counts
+        for i in range(self.num_players):
+            if old_positions[i] != self._prev_positions[i]:
+                continue
+            prev_pos = self._prev_prev_positions[i]
+            prev_action = self._prev_actions[i]
+            curr_action = joint_action[i]
+            if (
+                new_positions[i] == prev_pos
+                and prev_pos != old_positions[i]
+                and prev_action in Direction.ALL_DIRECTIONS
+                and curr_action in Direction.ALL_DIRECTIONS
+                and Direction.OPPOSITE_DIRECTIONS.get(prev_action) == curr_action
+            ):
+                counts[i] = 1
+        return counts
+
+    def update_step(self, new_positions, joint_action):
+        if self._prev_positions is None:
+            self._prev_positions = list(new_positions)
+            self._prev_prev_positions = None
+        else:
+            self._prev_prev_positions = self._prev_positions
+            self._prev_positions = list(new_positions)
+        self._prev_actions = list(joint_action)
+
 
 class Recipe:
     MAX_NUM_INGREDIENTS = 3
@@ -991,6 +1055,10 @@ class OvercookedGridworld:
         self._prev_potential_params = {}
         # determines whether to start cooking automatically once 3 items are in the pot
         self.old_dynamics = old_dynamics
+        self._subgoal_tracker = _SubgoalTracker(
+            self.num_players,
+            onion_regrab_window=kwargs.get("onion_regrab_window", 2),
+        )
 
     @staticmethod
     def from_layout_name(layout_name, **params_to_overwrite):
@@ -1247,6 +1315,12 @@ class OvercookedGridworld:
         # There is a finite horizon, handled by the environment.
         return False
 
+    def reset_subgoal_tracking(self, state):
+        if self._subgoal_tracker is None:
+            return
+        start_positions = [p.position for p in state.players]
+        self._subgoal_tracker.reset(start_positions=start_positions)
+
     def get_state_transition(self, state, joint_action, display_phi=False, motion_planner=None):
         """Gets information about possible transitions for the action.
 
@@ -1258,6 +1332,7 @@ class OvercookedGridworld:
         (not soup deliveries).
         """
         events_infos = {event: [False] * self.num_players for event in EVENT_TYPES}
+        error_infos = {err: [0] * self.num_players for err in ERROR_TYPES}
         assert not self.is_terminal(state), f"Trying to find successor of a terminal state: {state}"
         for action, action_set in zip(joint_action, self.get_actions(state)):
             if action not in action_set:
@@ -1270,13 +1345,13 @@ class OvercookedGridworld:
             sparse_reward_by_agent,
             shaped_reward_by_agent,
             shaped_info_by_agent,
-        ) = self.resolve_interacts(new_state, joint_action, events_infos)
+        ) = self.resolve_interacts(new_state, joint_action, events_infos, error_infos)
 
         assert new_state.player_positions == state.player_positions
         assert new_state.player_orientations == state.player_orientations
 
         # Resolve player movements
-        self.resolve_movement(new_state, joint_action, shaped_info_by_agent)
+        self.resolve_movement(new_state, joint_action, shaped_info_by_agent, error_infos)
 
         # Finally, environment effects
         self.step_environment_effects(new_state)
@@ -1288,6 +1363,7 @@ class OvercookedGridworld:
             "sparse_reward_by_agent": sparse_reward_by_agent,
             "shaped_reward_by_agent": shaped_reward_by_agent,
             "shaped_info_by_agent": shaped_info_by_agent,
+            "detect_error": error_infos,
         }
         if display_phi:
             assert motion_planner is not None, "motion planner must be defined if display_phi is true"
@@ -1295,7 +1371,7 @@ class OvercookedGridworld:
             infos["phi_s_prime"] = self.potential_function(new_state, motion_planner)
         return new_state, infos
 
-    def resolve_interacts(self, new_state, joint_action, events_infos):
+    def resolve_interacts(self, new_state, joint_action, events_infos, error_infos):
         """
         Resolve any INTERACT actions, if present.
 
@@ -1326,6 +1402,8 @@ class OvercookedGridworld:
                     obj_name = player.get_object().name
                     self.log_object_drop(events_infos, new_state, obj_name, pot_states, player_idx)
                     shaped_info[player_idx][f"put_{obj_name}_on_X"] += 1
+                    if obj_name == "onion" and self._subgoal_tracker is not None:
+                        self._subgoal_tracker.record_onion_drop(player_idx, i_pos, new_state.timestep)
 
                     # Drop object on counter
                     obj = player.remove_object()
@@ -1334,6 +1412,9 @@ class OvercookedGridworld:
                     obj_name = new_state.get_object(i_pos).name
                     self.log_object_pickup(events_infos, new_state, obj_name, pot_states, player_idx)
                     shaped_info[player_idx][f"pickup_{obj_name}_from_X"] += 1
+                    if obj_name == "onion" and self._subgoal_tracker is not None:
+                        if self._subgoal_tracker.check_onion_regrab(player_idx, i_pos, new_state.timestep):
+                            error_infos["ONION_COUNTER_REGRAB"][player_idx] += 1
 
                     # Pick up object from counter
                     obj = new_state.remove_object(i_pos)
@@ -1520,18 +1601,40 @@ class OvercookedGridworld:
 
         return self.get_recipe_value(state, soup.recipe)
 
-    def resolve_movement(self, state, joint_action, shaped_info_by_agent):
+    def resolve_movement(self, state, joint_action, shaped_info_by_agent, error_infos):
         """Resolve player movement and deal with possible collisions"""
-        old_positions, old_orientations = [p.position for p in state.players], [p.orientation for p in state.players]
-        new_positions, new_orientations = self.compute_new_positions_and_orientations(state.players, joint_action)
+        old_positions = [p.position for p in state.players]
+        old_orientations = [p.orientation for p in state.players]
+        intended_positions = []
+        new_orientations = []
+        for player_state, action in zip(state.players, joint_action):
+            new_pos, new_o = self._move_if_direction(player_state.position, player_state.orientation, action)
+            intended_positions.append(new_pos)
+            new_orientations.append(new_o)
+
+        collision = self.is_transition_collision(tuple(old_positions), tuple(intended_positions))
+        new_positions = old_positions if collision else intended_positions
+
+        if collision:
+            for player_idx in range(self.num_players):
+                error_infos["COLLISION"][player_idx] += 1
+        if self._subgoal_tracker is not None:
+            backtracks = self._subgoal_tracker.compute_idle_backtrack(old_positions, new_positions, joint_action)
+            for player_idx, count in enumerate(backtracks):
+                if count:
+                    error_infos["IDLE_BACKTRACK"][player_idx] += count
+
         if shaped_info_by_agent is not None:
             for player_idx, (old_pos, new_pos, old_o, new_o) in enumerate(
                 zip(old_positions, new_positions, old_orientations, new_orientations)
             ):
                 if joint_action[player_idx] in Direction.ALL_DIRECTIONS and old_pos == new_pos and old_o == new_o:
                     shaped_info_by_agent[player_idx]["IDLE_MOVEMENT"] += 1
+
         for player_state, new_pos, new_o in zip(state.players, new_positions, new_orientations):
             player_state.update_pos_and_or(new_pos, new_o)
+        if self._subgoal_tracker is not None:
+            self._subgoal_tracker.update_step(new_positions, joint_action)
 
     def compute_new_positions_and_orientations(self, old_player_states, joint_action):
         """Compute new positions and orientations ignoring collisions"""

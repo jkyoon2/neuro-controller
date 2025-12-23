@@ -10,6 +10,7 @@ from zsceval.algorithms.hmarl.hmarl_policy import HMARLPolicy
 from zsceval.algorithms.hmarl.hmarl_trainer import HMARLTrainer
 from zsceval.algorithms.hmarl.vae import SkillVAE
 from zsceval.runner.separated.base_runner import _t2n
+from zsceval.utils.constraint import NegativeSkillBuffer
 from zsceval.utils.hmarl_buffer import HighLevelReplayBuffer, LowLevelRolloutBuffer
 from zsceval.utils.log_util import eta
 
@@ -101,6 +102,18 @@ class HMARLRunner:
             self.skill_dim,
             device=self.device,
         )
+
+        # Constraint buffer (negative skills from human feedback)
+        self.use_constraint = getattr(self.all_args, "use_constraint", False)
+        self.segment_penalty = np.zeros((self.n_rollout_threads, 1), dtype=np.float32)
+        self.neg_buffer = None
+        if self.use_constraint:
+            self.neg_buffer = NegativeSkillBuffer(
+                device=self.device,
+                threshold=getattr(self.all_args, "constraint_threshold", 0.5),
+                penalty_weight=getattr(self.all_args, "constraint_penalty", 1.0),
+            )
+            self._init_negative_buffer()
         
         # States
         self.current_skills = np.zeros((self.n_rollout_threads, self.num_agents, self.skill_dim), dtype=np.float32)
@@ -228,6 +241,147 @@ class HMARLRunner:
                 logger.warning("No 'layout_to_id' found in VAE checkpoint. Cannot assign automatic Task ID.")
                 self.all_args.current_task_id = None
 
+    def _init_negative_buffer(self):
+        bad_traj_path = getattr(self.all_args, "bad_traj_path", None)
+        if not bad_traj_path:
+            logger.warning("Constraint enabled but no bad_traj_path provided.")
+            return
+
+        try:
+            bad_trajs = np.load(bad_traj_path, allow_pickle=True)
+        except Exception as exc:
+            logger.warning(f"Failed to load bad trajectories from {bad_traj_path}: {exc}")
+            return
+
+        if isinstance(bad_trajs, np.lib.npyio.NpzFile):
+            if "trajs" in bad_trajs:
+                bad_trajs = bad_trajs["trajs"]
+            elif "data" in bad_trajs:
+                bad_trajs = bad_trajs["data"]
+            elif len(bad_trajs.files) > 0:
+                bad_trajs = bad_trajs[bad_trajs.files[0]]
+            else:
+                logger.warning(f"Bad trajectory file {bad_traj_path} is empty.")
+                return
+
+        if isinstance(bad_trajs, np.ndarray):
+            if bad_trajs.ndim == 2 and bad_trajs.shape[1] == self.skill_dim:
+                self.neg_buffer.add_skills(bad_trajs)
+                logger.info(f"Initialized NegativeSkillBuffer with {bad_trajs.shape[0]} pre-encoded skills.")
+                return
+
+        if isinstance(bad_trajs, np.ndarray):
+            bad_trajs = bad_trajs.tolist()
+        if isinstance(bad_trajs, list) and bad_trajs:
+            first = np.asarray(bad_trajs[0])
+            if first.ndim == 1 and first.shape[0] == self.skill_dim:
+                self.neg_buffer.add_skills(np.asarray(bad_trajs))
+                logger.info(f"Initialized NegativeSkillBuffer with {len(bad_trajs)} pre-encoded skills.")
+                return
+
+        skill_decoder = getattr(self.all_args, "skill_decoder", None)
+        if skill_decoder is None:
+            logger.warning("Constraint enabled but no skill decoder loaded.")
+            return
+
+        task_id = getattr(self.all_args, "current_task_id", None)
+        if task_id is None:
+            logger.warning("Constraint enabled but current_task_id is missing.")
+            return
+        if torch.is_tensor(task_id):
+            task_id = task_id.to(self.device)
+
+        obs_shape = get_shape_from_space(self.envs.observation_space[0])
+        obs_channels = obs_shape[-1] if len(obs_shape) >= 3 else obs_shape[0]
+        action_space = self.envs.action_space[0]
+        action_dim = action_space.n if hasattr(action_space, "n") else int(np.prod(action_space.shape))
+
+        def _format_obs(obs_seq):
+            obs_arr = np.asarray(obs_seq)
+            if obs_arr.ndim != 4:
+                return None
+            if obs_arr.shape[-1] == obs_channels:
+                obs_arr = obs_arr.transpose(0, 3, 1, 2)
+            elif obs_arr.shape[1] != obs_channels:
+                return None
+            return obs_arr.astype(np.float32)
+
+        def _to_onehot(actions):
+            act_arr = np.asarray(actions)
+            if act_arr.ndim == 1:
+                return np.eye(action_dim, dtype=np.float32)[act_arr.astype(int)]
+            if act_arr.ndim == 2 and act_arr.shape[1] == 1:
+                return np.eye(action_dim, dtype=np.float32)[act_arr[:, 0].astype(int)]
+            if act_arr.ndim == 2 and act_arr.shape[1] == action_dim:
+                return act_arr.astype(np.float32)
+            return None
+
+        z_bad_list = []
+        decoder_type = getattr(self.all_args, "skill_decoder_type", "vae")
+        with torch.no_grad():
+            for traj in bad_trajs:
+                if isinstance(traj, dict):
+                    obs_seq = traj.get("obs", None)
+                    act_seq = traj.get("actions", traj.get("action", None))
+                elif isinstance(traj, (list, tuple)) and len(traj) >= 2:
+                    obs_seq, act_seq = traj[0], traj[1]
+                else:
+                    logger.warning("Skipping bad trajectory with unsupported format.")
+                    continue
+
+                if obs_seq is None or act_seq is None:
+                    logger.warning("Skipping bad trajectory missing obs/actions.")
+                    continue
+
+                obs_arr = np.asarray(obs_seq)
+                act_arr = np.asarray(act_seq)
+                if obs_arr.ndim == 5 and obs_arr.shape[1] == self.num_agents:
+                    obs_slices = [obs_arr[:, i] for i in range(self.num_agents)]
+                    if act_arr.ndim >= 2 and act_arr.shape[1] == self.num_agents:
+                        act_slices = [act_arr[:, i] for i in range(self.num_agents)]
+                    else:
+                        act_slices = [act_arr for _ in range(self.num_agents)]
+                elif obs_arr.ndim == 5 and obs_arr.shape[0] == self.num_agents:
+                    obs_slices = [obs_arr[i] for i in range(self.num_agents)]
+                    if act_arr.ndim >= 2 and act_arr.shape[0] == self.num_agents:
+                        act_slices = [act_arr[i] for i in range(self.num_agents)]
+                    else:
+                        act_slices = [act_arr for _ in range(self.num_agents)]
+                elif obs_arr.ndim == 4:
+                    obs_slices = [obs_arr]
+                    act_slices = [act_arr]
+                else:
+                    logger.warning(f"Skipping bad trajectory with obs shape {obs_arr.shape}.")
+                    continue
+
+                for obs_slice, act_slice in zip(obs_slices, act_slices):
+                    obs_formatted = _format_obs(obs_slice)
+                    act_onehot = _to_onehot(act_slice)
+                    if obs_formatted is None or act_onehot is None:
+                        logger.warning("Skipping bad trajectory with incompatible obs/actions.")
+                        continue
+
+                    obs_tensor = torch.as_tensor(obs_formatted[None], device=self.device, dtype=torch.float32)
+                    act_tensor = torch.as_tensor(act_onehot[None], device=self.device, dtype=torch.float32)
+                    if decoder_type == "vae":
+                        z_bad = skill_decoder.encode(obs_tensor, act_tensor, task_id, deterministic=True)
+                    else:
+                        z_bad = skill_decoder.encode(obs_tensor, act_tensor, task_id)
+                    z_bad_list.append(z_bad)
+
+        if z_bad_list:
+            self.neg_buffer.add_skills(torch.cat(z_bad_list, dim=0))
+            logger.info(f"Initialized NegativeSkillBuffer with {len(z_bad_list)} skills.")
+
+    def _update_constraint_penalty(self):
+        if not self.use_constraint or self.neg_buffer is None:
+            return
+        skills = torch.as_tensor(self.current_skills, device=self.device, dtype=torch.float32)
+        flat_skills = skills.reshape(-1, self.skill_dim)
+        penalty, _ = self.neg_buffer.compute_penalty(flat_skills)
+        penalty = penalty.view(self.n_rollout_threads, self.num_agents, 1).mean(dim=1)
+        self.segment_penalty = _t2n(penalty)
+
     def run(self):
         self.warmup()
         start = 0
@@ -307,33 +461,53 @@ class HMARLRunner:
                 logger.info(
                     f"HMARL updates {episode}/{episodes}, total timesteps {total_num_steps}/{self.num_env_steps}"
                 )
-                # Episode-total returns averaged over envs
-                env_mean_sparse = np.mean(ep_sparse_r, axis=0)
-                env_mean_extrinsic = np.mean(ep_extrinsic_r, axis=0)
-                env_mean_intrinsic = np.mean(ep_intrinsic_r, axis=0)
-                env_mean_low_train = np.mean(ep_low_total_r, axis=0)
-                env_mean_high_train = float(np.mean(ep_high_r))
+
+                # ep_sparse_r: (n_threads, n_agents)
+                sp_mean, sp_low, sp_high = self.compute_stats(ep_sparse_r)
+                ex_mean, ex_low, ex_high = self.compute_stats(ep_extrinsic_r)
+                in_mean, in_low, in_high = self.compute_stats(ep_intrinsic_r)
+                low_mean, low_low, low_high = self.compute_stats(ep_low_total_r)
+
+                # High level team reward (50, 1) -> (50,)
+                high_mean, high_low, high_high = self.compute_stats(ep_high_r/10.0)
+
+                # Environment-level mean episode returns
+                env_mean_low_train = np.mean(low_mean)
+                env_mean_high_train = np.mean(high_mean)
 
                 avg_rewards = {}
                 for a in range(self.num_agents):
-                    train_infos["low"][a]["average_episode_rewards"] = env_mean_low_train[a]
-                    avg_rewards[a] = env_mean_low_train[a]
-                    logger.info(f"agent {a} average episode rewards {env_mean_low_train[a]}")
+                    train_infos["low"][a]["average_episode_rewards"] = low_mean[a]
+                    avg_rewards[a] = low_mean[a]
+                    logger.info(f"agent {a} average episode rewards {low_mean[a]}")
 
                 if self.use_wandb:
                     for a in range(self.num_agents):
                         wandb.log(
                             {
-                                f"reward/sparse/agent{a}": env_mean_sparse[a],
-                                f"reward/extrinsic/agent{a}": env_mean_extrinsic[a],
-                                f"reward/intrinsic/agent{a}": env_mean_intrinsic[a],
-                                f"reward/low_level_total/agent{a}": env_mean_low_train[a],
-                                f"train/low_level_return/agent{a}": env_mean_low_train[a],
+                                f"reward/sparse/agent{a}/mean": sp_mean[a],
+                                f"reward/sparse/agent{a}/lower": sp_low[a],
+                                f"reward/sparse/agent{a}/upper": sp_high[a],
+
+                                f"reward/extrinsic/agent{a}/mean": ex_mean[a],
+                                f"reward/extrinsic/agent{a}/lower": ex_low[a],
+                                f"reward/extrinsic/agent{a}/upper": ex_high[a],
+
+                                f"reward/intrinsic/agent{a}/mean": in_mean[a],
+                                f"reward/intrinsic/agent{a}/lower": in_low[a],
+                                f"reward/intrinsic/agent{a}/upper": in_high[a],
+
+                                f"reward/low_level_total/agent{a}/mean": low_mean[a],
+                                f"reward/low_level_total/agent{a}/lower": low_low[a],
+                                f"reward/low_level_total/agent{a}/upper": low_high[a],
                             },
                             step=total_num_steps,
                         )
-                    wandb.log({f"reward/high_level_team": env_mean_high_train}, step=total_num_steps)
-                    wandb.log({f"train/high_level_return": env_mean_high_train}, step=total_num_steps)
+                    wandb.log({
+                        f"reward/high_level_team/mean": high_mean,
+                        f"reward/high_level_team/lower": high_low,
+                        f"reward/high_level_team/upper": high_high,
+                        }, step=total_num_steps)
 
                 logger.info(f"Episode Return (Low): {env_mean_low_train}")
                 logger.info(f"Episode Return (High): {env_mean_high_train}")
@@ -353,6 +527,8 @@ class HMARLRunner:
         self.segment_start_obs = all_agent_obs
         self.segment_start_share_obs = share_obs
         self.current_skills, self.rnn_states_actor_high = self.sample_skills(share_obs, all_agent_obs, 0, None, masks=self.high_masks)
+        if self.use_constraint:
+            self._update_constraint_penalty()
 
         for agent_id in range(self.num_agents):
             self.low_buffers[agent_id].share_obs[0] = share_obs[:, agent_id] if self.use_centralized_V else all_agent_obs[:, agent_id]
@@ -448,7 +624,7 @@ class HMARLRunner:
 
                 for idx, val in enumerate(values):
                     key = self.shaped_info_keys[idx] if idx < len(self.shaped_info_keys) else f"event_{idx}"
-                    ep_events[key][env_idx, a] += float(val)
+                    ep_events[key][env_idx, a] = float(val)
 
     def store_segment_trajectories(self, obs, actions):
         """Accumulate obs/actions for intrinsic reward calculation at segment end."""
@@ -467,6 +643,22 @@ class HMARLRunner:
                 else:
                     onehot = act_arr
                 self.segment_traj_actions[e][a].append(onehot)
+
+    def compute_stats(self, data_array):
+        """Computes mean and 95% confidence interval bounds.
+        data_array: (n_samples, n_agents) array of episode returns
+        Returns:
+            mean: (n_agents,) array of means
+            ci_lower: (n_agents,) array of lower bounds
+            ci_upper: (n_agents,) array of upper bounds
+        """
+        n = data_array.shape[0]
+        mean = np.mean(data_array, axis=0)
+        std = np.std(data_array, axis=0)
+        # 95% confidence interval: mean +/- 1.96 * (std / sqrt(n))
+        ci_lower = mean - 1.96 * (std / np.sqrt(n))
+        ci_upper = mean + 1.96 * (std / np.sqrt(n))
+        return mean, ci_lower, ci_upper
 
     def update_sparse_episode_rewards(self, infos, ep_sparse_r):
         """Grab sparse episode totals from env info when available."""
@@ -515,13 +707,17 @@ class HMARLRunner:
     def finish_segment(self, obs, share_obs, dones, ep_intrinsic_r, ep_low_total_r):
         next_masks = 1.0 - dones.astype(np.float32).reshape(self.n_rollout_threads, self.num_agents, 1)
 
+        adjusted_reward = self.segment_reward
+        if self.use_constraint:
+            adjusted_reward = self.segment_reward - self.segment_penalty
+
         # add to high-level buffer with masks and rnn states (per env entry)
         for env_idx in range(self.n_rollout_threads):
             self.high_buffer.add(
                 self.segment_start_obs[env_idx],
                 self.segment_start_share_obs[env_idx],
                 self.current_skills[env_idx],
-                self.segment_reward[env_idx].copy()/ 100.0,  # scale down high-level reward
+                adjusted_reward[env_idx].copy() / 10.0,  # scale down high-level reward
                 obs[env_idx],
                 share_obs[env_idx],
                 dones[env_idx].astype(np.float32).reshape(-1, 1),
@@ -551,7 +747,7 @@ class HMARLRunner:
 
                 start_idx = (self.low_buffers[a].step - seg_len) % self.episode_length
                 idxs = [(start_idx + k) % self.episode_length for k in range(seg_len)]
-                current_extrinsic = self.low_buffers[a].rewards[idxs, e, 0]
+                current_extrinsic = self.low_buffers[a].rewards[idxs, e, 0] / 10.0  # scale down extrinsic
                 alpha = self.low_trainers[a].intrinsic_alpha
                 new_reward = alpha * current_extrinsic + (1 - alpha) * per_step_intrinsic
                 self.low_buffers[a].rewards[idxs, e, 0] = new_reward
@@ -567,6 +763,8 @@ class HMARLRunner:
         self.segment_traj_actions = [[[] for _ in range(self.num_agents)] for _ in range(self.n_rollout_threads)]
         # resample skills
         self.current_skills, self.rnn_states_actor_high = self.sample_skills(share_obs, obs, 0, None, masks=self.high_masks)
+        if self.use_constraint:
+            self._update_constraint_penalty()
 
     @torch.no_grad()
     def compute(self):
@@ -628,9 +826,15 @@ class HMARLRunner:
             return
 
         for event_name, data in ep_events.items():
-            env_mean_events = np.mean(data, axis=0)
+            # data: (n_threads, n_agents)
+            mean, lower, upper = self.compute_stats(data)
+
             for agent_id in range(self.num_agents):
-                wandb.log({f"events/agent{agent_id}/{event_name}": float(env_mean_events[agent_id])}, step=total_num_steps)
+                wandb.log({
+                    f"events/agent{agent_id}/{event_name}/mean": float(mean[agent_id]),
+                    f"events/agent{agent_id}/{event_name}/lower": float(lower[agent_id]),
+                    f"events/agent{agent_id}/{event_name}/upper": float(upper[agent_id]),
+                }, step=total_num_steps)
 
     def save(self, steps=None):
         postfix = f"_{steps}.pt" if steps else ".pt"

@@ -239,8 +239,8 @@ def get_config() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--use_recurrent_policy",
-        action="store_false",
-        default=True,
+        action="store_true",
+        default=False,
         help="use a recurrent policy",
     )
     parser.add_argument("--recurrent_N", type=int, default=1, help="The number of recurrent layers.")

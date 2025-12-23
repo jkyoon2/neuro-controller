@@ -304,6 +304,8 @@ class OvercookedEnv:
         else:
             self.state = self.start_state_fn()
         self.state = self.state.deepcopy()
+        if hasattr(self.mdp, "reset_subgoal_tracking"):
+            self.mdp.reset_subgoal_tracking(self.state)
 
         events_dict = {k: [[] for _ in range(self.mdp.num_players)] for k in EVENT_TYPES}
         rewards_dict = {
@@ -1194,6 +1196,7 @@ class Overcooked(gym.Env):
                   - "shaped_info_by_agent": List[Dict] - cumulative episode counts
                   - "sparse_r": float - sparse reward (delivery)
                   - "shaped_r_by_agent": List[float] - dense reward per agent
+                  - "detect_error": Dict[str, List[int]] - per-timestep error flags
                   - "all_agent_obs": np.array (N, H, W, C)
                   - "share_obs": np.array (N, H, W, C_share)
                   - "available_actions": np.array (N, num_actions)

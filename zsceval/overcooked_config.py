@@ -55,11 +55,14 @@ def get_overcooked_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
         type=float,
         help="Probability to use a random start state, default 0.",
     )
+
+    parser.add_argument("--old_dynamics", default=False, action="store_true")
     parser.add_argument("--use_random_terrain_state", default=False, action="store_true")
     parser.add_argument("--use_random_player_pos", default=False, action="store_true")
     parser.add_argument("--overcooked_version", default="old", type=str, choices=["new", "old"])
     parser.add_argument("--random_index", default=False, action="store_true")
     parser.add_argument("--use_hsp", default=False, action="store_true")
+    parser.add_argument("--use_phi", default=False, action="store_true")
     parser.add_argument("--w0_offset", default=0, type=int)
     parser.add_argument(
         "--w0",

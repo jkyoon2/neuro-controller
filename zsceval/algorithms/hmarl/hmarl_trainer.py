@@ -349,7 +349,7 @@ class LowLevelTrainer:
             else:
                 z_actual = self.vae.encode(obs_seq, action_seq, self.current_task_id)
             mse = torch.sum((target_skill - z_actual) ** 2, dim=-1)
-            intrinsic = self.intrinsic_scale * (1.0 / (1.0 + mse))
+            intrinsic = self.intrinsic_scale * torch.exp(-mse)
         return intrinsic.item()
 
     def compute_intrinsic_reward(self, obs_seq: torch.Tensor, action_seq: torch.Tensor, target_skill: torch.Tensor):

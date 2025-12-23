@@ -8,8 +8,8 @@ num_env_steps="1e7"
 num_agents=2
 algo="hmarl"
 exp="sp"
-seed_begin=6
-seed_max=10
+seed_begin=11
+seed_max=15
 ulimit -n 65536
 
 entropy_coefs="0.2 0.05 0.01"
@@ -17,10 +17,10 @@ entropy_coef_horizons="0 5e6 1e7"
 reward_shaping_horizon="1e8"
 agent_policy_names="ppo ppo"
 
-vae_checkpoint_path="/home/juliecandoit98/neurocontroller/checkpoints/vae_epoch_010_1tasks_4d.pt"
+vae_checkpoint_path="/home/juliecandoit98/neurocontroller/checkpoints/vae_epoch_004_1t_small_corridor_4d.pt"
 skill_dim=4
-intrinsic_scale=1.0
-intrinsic_alpha=0.3
+intrinsic_scale=50.0
+intrinsic_alpha=0.9
 t_seg=5
 
 w0="0,0,0,0,0,0.1,0.1,0,0,0.1,0,3,0,10,-2,3,2,2,-2,-2,5,5,0,20,-5,0,7,20,-5,-0.01,-0.01,-0.01,-0.01,30"

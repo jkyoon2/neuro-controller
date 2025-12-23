@@ -1,0 +1,48 @@
+# configs/gen_bad_skills.yaml
+
+# [Target Environment]
+env_name: "Overcooked"
+layout_name: "small_corridor"
+algorithm_name: "hmarl"
+experiment_name: "sp"
+overcooked_version: "new"
+
+# Training-time model hyperparams (match train_hmarl.sh)
+cnn_layers_params: "32,3,1,1 64,3,1,1 32,3,1,1"
+use_recurrent_policy: false
+skill_dim: 4
+t_seg: 5
+
+agent_policy_names:
+  - ppo
+  - ppo
+
+# [Bad Skill Generation Params]
+bad_segment_pre: 3
+bad_segment_post: 1
+bad_skill_output: "results/bad_skills/small_corridor_bad_skills.npy"
+
+# [VAE Model Path]
+vae_checkpoint_path: "/home/juliecandoit98/neurocontroller/checkpoints/vae_epoch_005_1t_small_corridor_4d.pt"
+
+# [Policy Loading Strategy]
+# Case 1: Self-Play (모두 같은 시드, 같은 스텝)
+load_seeds: [10]
+load_steps: [5020000]
+
+# Case 2: Cross-Play (서로 다른 시드, 다른 스텝) - 주석 해제하여 사용
+# load_seeds: [1, 2]
+# load_steps: [30000, 40000]
+
+# [Execution Params]
+num_agents: 2
+n_rollout_threads: 1
+episode_length: 400
+num_episodes: 50
+use_render: false
+cuda: true
+
+# [Target Error Types]
+# Only collect specified error types; comment out to collect all.
+target_error_types:
+  - "ONION_COUNTER_REGRAB"

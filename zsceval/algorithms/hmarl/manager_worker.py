@@ -449,7 +449,7 @@ class HighLevelActor(nn.Module):
         super().__init__()
         self.hidden_size = args.hidden_size
         self.skill_dim = getattr(args, "skill_dim", getattr(args, "latent_dim", 4))
-        self.skill_range = getattr(args, "skill_range", 2.0)
+        self.skill_range = getattr(args, "skill_range", 4.0)
         self.t_seg = getattr(args, "t_seg", 5)
 
         self._use_orthogonal = args.use_orthogonal
